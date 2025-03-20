@@ -137,6 +137,41 @@ class NgramProber:
                 torch.cuda.empty_cache()
         
         ngram_counts = Counter(all_ngrams)
+        total_positions = len(all_ngrams)
+        
+        # Create frequency vs rank plot
+        print("\nCreating frequency vs rank plot...")
+        plt.figure(figsize=(12, 6))
+        
+        # Get all counts and sort them in descending order
+        counts = sorted(ngram_counts.values(), reverse=True)
+        frequencies = [count / total_positions * 100 for count in counts]
+        ranks = list(range(1, len(frequencies) + 1))
+        
+        plt.plot(ranks, frequencies, 'b-', alpha=0.7, linewidth=1)
+        plt.yscale('log')
+        plt.xscale('log')
+        plt.grid(True, which="both", ls="-", alpha=0.2)
+        plt.title(f"N-gram Frequency Distribution (n={self.config.ngram_size})")
+        plt.xlabel("Rank (log scale)")
+        plt.ylabel("Frequency % (log scale)")
+        
+        # Add vertical lines for cutoffs
+        if self.config.ignore_top_n > 0:
+            plt.axvline(x=self.config.ignore_top_n, color='r', linestyle='--', alpha=0.5, 
+                       label=f'Ignore top {self.config.ignore_top_n}')
+        plt.axvline(x=self.config.top_m_ngrams + self.config.ignore_top_n, color='g', 
+                   linestyle='--', alpha=0.5, 
+                   label=f'Keep top {self.config.top_m_ngrams}')
+        
+        plt.legend()
+        
+        # Save plot
+        os.makedirs(os.path.join(self.config.output_dir, "plots"), exist_ok=True)
+        plot_path = os.path.join(self.config.output_dir, "plots", "ngram_frequency_distribution.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved frequency distribution plot to {plot_path}")
         
         # Get top N+k n-grams, then remove top k
         top_ngrams = ngram_counts.most_common(self.config.top_m_ngrams + self.config.ignore_top_n)[self.config.ignore_top_n:]
@@ -167,43 +202,64 @@ class NgramProber:
         """Get the path for caching model activations."""
         cache_name = (f"activations_"
                      f"layer{self.config.layer}_"
-                     f"ctx{self.config.ctx_len}.pt")
+                     f"ctx{self.config.ctx_len}")
         return os.path.join(self.config.output_dir, "cache", cache_name)
 
     def generate_and_save_activations(self, tokens: torch.Tensor) -> None:
-        """Generate activations for all tokens and save them to disk."""
-        cache_path = self.get_activations_cache_path()
+        """Generate activations for all tokens and save them to disk in chunks."""
+        cache_dir = os.path.join(self.config.output_dir, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        base_path = self.get_activations_cache_path()
         
-        print("\nGenerating activations...")
-        all_activations = []
+        print("\nGenerating activations in chunks...")
+        chunk_size = min(self.config.chunk_size, len(tokens))  # Process chunk_size sequences at a time
+        num_chunks = (len(tokens) + chunk_size - 1) // chunk_size
         
-        for i in tqdm(range(0, len(tokens), self.config.model_batch_size)):
-            batch_tokens = tokens[i:i + self.config.model_batch_size]
-            with torch.no_grad():
-                activations = self.get_activations_batch(batch_tokens)
-                all_activations.append(activations.cpu())
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min((chunk_idx + 1) * chunk_size, len(tokens))
             
-            del activations
+            print(f"\nProcessing chunk {chunk_idx + 1}/{num_chunks} (sequences {start_idx} to {end_idx})")
+            chunk_activations = []
+            
+            # Process the chunk in batches
+            for i in tqdm(range(start_idx, end_idx, self.config.model_batch_size)):
+                batch_end = min(i + self.config.model_batch_size, end_idx)
+                batch_tokens = tokens[i:batch_end]
+                
+                with torch.no_grad():
+                    activations = self.get_activations_batch(batch_tokens)
+                    chunk_activations.append(activations.cpu())
+                
+                del activations
+                torch.cuda.empty_cache()
+            
+            # Save this chunk
+            chunk_activations = torch.cat(chunk_activations, dim=0)
+            chunk_path = f"{base_path}_chunk{chunk_idx}.pt"
+            torch.save(chunk_activations, chunk_path)
+            print(f"Saved chunk {chunk_idx} with shape {chunk_activations.shape}")
+            
+            del chunk_activations
             torch.cuda.empty_cache()
-        
-        print("Concatenating activations...")
-        activations = torch.cat(all_activations, dim=0)
-        print(f"Total activations shape: {activations.shape}")
-        
-        print("Saving activations to disk...")
-        torch.save(activations, cache_path)
-        print(f"Saved activations to {cache_path}")
-        
-        del activations, all_activations
-        torch.cuda.empty_cache()
 
-    def load_activations(self) -> Optional[torch.Tensor]:
-        """Load cached activations if they exist."""
-        cache_path = self.get_activations_cache_path()
-        if os.path.exists(cache_path):
-            print("\nLoading cached activations...")
-            return torch.load(cache_path)
+    def load_activations_chunk(self, chunk_idx: int) -> Optional[torch.Tensor]:
+        """Load a specific chunk of activations."""
+        base_path = self.get_activations_cache_path()
+        chunk_path = f"{base_path}_chunk{chunk_idx}.pt"
+        
+        if os.path.exists(chunk_path):
+            return torch.load(chunk_path)
         return None
+
+    def get_num_chunks(self) -> int:
+        """Get the number of activation chunks."""
+        chunk_idx = 0
+        while True:
+            if not os.path.exists(f"{self.get_activations_cache_path()}_chunk{chunk_idx}.pt"):
+                break
+            chunk_idx += 1
+        return chunk_idx
 
     def prepare_probe_data(
         self,
@@ -240,11 +296,10 @@ class NgramProber:
     def train_probe(
         self,
         tokens: torch.Tensor,
-        activations: torch.Tensor,
         ngrams: List[Tuple[int, ...]],
         ngram_to_idx: Dict[Tuple[int, ...], int]
     ) -> Dict[str, Dict[str, float]]:
-        """Train both types of probes using pre-computed activations."""
+        """Train both types of probes using chunked activations."""
         total_tokens = len(tokens) * self.config.ctx_len
         required_tokens = self.config.num_train_tokens + self.config.num_val_tokens
         if required_tokens > total_tokens:
@@ -270,10 +325,8 @@ class NgramProber:
                 print(f"N-gram: {self.model.to_string(torch.tensor(ngram))}, "
                       f"frequency: {freq:.3f}%")
         
-        train_tokens = tokens[:self.config.num_train_sequences]
-        val_tokens = tokens[self.config.num_train_sequences:self.config.num_train_sequences + self.config.num_val_sequences]
-        train_activations = activations[:self.config.num_train_sequences]
-        val_activations = activations[self.config.num_train_sequences:self.config.num_train_sequences + self.config.num_val_sequences]
+        num_chunks = self.get_num_chunks()
+        train_chunks = num_chunks * self.config.num_train_sequences // len(tokens)
         
         results = {}
         
@@ -289,63 +342,82 @@ class NgramProber:
             optimizer = torch.optim.Adam(probe.parameters(), lr=self.config.learning_rate)
             
             # Training loop with progress bar
-            pbar = tqdm(range(0, len(train_tokens), self.config.batch_size), 
-                       desc=f"Training {probe_type}-position probe")
+            pbar = tqdm(range(train_chunks), desc=f"Training {probe_type}-position probe")
             running_loss = 0
             num_batches = 0
             
-            for i in pbar:
-                batch_end = min(i + self.config.batch_size, len(train_tokens))
-                batch_tokens = train_tokens[i:batch_end]
-                batch_activations = train_activations[i:batch_end]
+            for chunk_idx in pbar:
+                activations = self.load_activations_chunk(chunk_idx)
+                if activations is None:
+                    continue
                 
-                activations_batch, labels = self.prepare_probe_data(
-                    batch_tokens, batch_activations, ngrams, ngram_to_idx, probe_type
-                )
+                chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
                 
-                logits = probe(activations_batch)
-                loss = probe.compute_loss(logits, labels, self.config.positive_weight)
-                
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                running_loss = 0.9 * running_loss + 0.1 * loss.item() if num_batches > 0 else loss.item()
-                num_batches += 1
-                pbar.set_postfix({'loss': f'{running_loss:.4f}'})
-                
-                del activations_batch, labels, logits
-                torch.cuda.empty_cache()
-            
-            # Evaluation
-            probe.eval()
-            with torch.no_grad():
-                all_logits = []
-                all_labels = []
-                
-                for i in tqdm(range(0, len(val_tokens), self.config.batch_size), 
-                            desc=f"Evaluating {probe_type}-position probe"):
-                    batch_end = min(i + self.config.batch_size, len(val_tokens))
-                    batch_tokens = val_tokens[i:batch_end]
-                    batch_activations = val_activations[i:batch_end]
+                for i in range(0, len(chunk_tokens), self.config.batch_size):
+                    batch_end = min(i + self.config.batch_size, len(chunk_tokens))
+                    batch_tokens = chunk_tokens[i:batch_end]
+                    batch_activations = activations[i:batch_end]
                     
                     activations_batch, labels = self.prepare_probe_data(
                         batch_tokens, batch_activations, ngrams, ngram_to_idx, probe_type
                     )
-                    logits = probe(activations_batch)
                     
-                    all_logits.append(logits.cpu())
-                    all_labels.append(labels.cpu())
+                    logits = probe(activations_batch)
+                    loss = probe.compute_loss(logits, labels, self.config.positive_weight)
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    
+                    running_loss = 0.9 * running_loss + 0.1 * loss.item() if num_batches > 0 else loss.item()
+                    num_batches += 1
+                    pbar.set_postfix({'loss': f'{running_loss:.4f}'})
                     
                     del activations_batch, labels, logits
                     torch.cuda.empty_cache()
                 
-                logits = torch.cat(all_logits, dim=0)
-                labels = torch.cat(all_labels, dim=0)
-                aurocs = probe.compute_metrics(logits, labels)
-                
-                del logits, labels, all_logits, all_labels
+                del activations
                 torch.cuda.empty_cache()
+            
+            # Evaluation
+            probe.eval()
+            all_logits = []
+            all_labels = []
+            
+            print(f"\nEvaluating {probe_type}-position probe...")
+            for chunk_idx in range(train_chunks, num_chunks):
+                activations = self.load_activations_chunk(chunk_idx)
+                if activations is None:
+                    continue
+                    
+                chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
+                
+                with torch.no_grad():
+                    for i in tqdm(range(0, len(chunk_tokens), self.config.batch_size)):
+                        batch_end = min(i + self.config.batch_size, len(chunk_tokens))
+                        batch_tokens = chunk_tokens[i:batch_end]
+                        batch_activations = activations[i:batch_end]
+                        
+                        activations_batch, labels = self.prepare_probe_data(
+                            batch_tokens, batch_activations, ngrams, ngram_to_idx, probe_type
+                        )
+                        logits = probe(activations_batch)
+                        
+                        all_logits.append(logits.cpu())
+                        all_labels.append(labels.cpu())
+                        
+                        del activations_batch, labels, logits
+                        torch.cuda.empty_cache()
+                
+                del activations
+                torch.cuda.empty_cache()
+            
+            logits = torch.cat(all_logits, dim=0)
+            labels = torch.cat(all_labels, dim=0)
+            aurocs = probe.compute_metrics(logits, labels)
+            
+            del logits, labels, all_logits, all_labels
+            torch.cuda.empty_cache()
             
             # Save final model
             final_model_path = os.path.join(self.config.output_dir, f"probe_{probe_type}_final.pt")
@@ -471,12 +543,12 @@ def main():
                   f"frequency: {freq:.3f}%")
     
     # Generate or load activations
-    activations = prober.load_activations()
+    activations = prober.load_activations_chunk(0)
     if activations is None:
         prober.generate_and_save_activations(tokens)
-        activations = prober.load_activations()
+        activations = prober.load_activations_chunk(0)
     
-    results = prober.train_probe(tokens, activations, ngram_list, ngram_to_idx)
+    results = prober.train_probe(tokens, ngram_list, ngram_to_idx)
     prober.save_results(results, config.output_dir)
 
 if __name__ == "__main__":

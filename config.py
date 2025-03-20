@@ -18,19 +18,19 @@ class NgramProbingConfig:
     dataset_name: str = "roneneldan/TinyStories"
     dataset_split: str = "train"
     max_texts: int = 200_000  # Default to 200k texts
-    ctx_len: int = 16
-    batch_size: int = 4096
+    ctx_len: int = 128
+    batch_size: int = 1024
+    chunk_size: int = 50_000  # Number of sequences per chunk for activation caching
     
     # N-gram settings
     ngram_size: int = 3
     top_m_ngrams: int = 1000
-    ignore_top_n: int = 10  # Number of most frequent n-grams to ignore
+    ignore_top_n: int = 100  # Number of most frequent n-grams to ignore
     
     # Training settings
     learning_rate: float = 1e-3
     num_epochs: int = 1
     positive_weight: float = 100
-    eval_batch_size: int = 4096
     num_train_tokens: int = int(10e6)
     num_val_tokens: int = int(1e6)
     
