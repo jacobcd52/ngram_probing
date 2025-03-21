@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 import os
 import torch
+import math
 
 @dataclass
 class NgramProbingConfig:
@@ -18,14 +19,14 @@ class NgramProbingConfig:
     dataset_name: str = "roneneldan/TinyStories"
     dataset_split: str = "train"
     max_texts: int = 200_000  # Default to 200k texts
-    ctx_len: int = 128
-    batch_size: int = 1024
-    chunk_size: int = 50_000  # Number of sequences per chunk for activation caching
+    ctx_len: int = 16
+    batch_size: int = 4096
+    chunk_size: int = 10_000  # Reduced from 50k to get more chunks
     
     # N-gram settings
     ngram_size: int = 3
-    top_m_ngrams: int = 1000
-    ignore_top_n: int = 100  # Number of most frequent n-grams to ignore
+    top_m_ngrams: int = 100
+    ignore_top_n: int = 10  # Number of most frequent n-grams to ignore
     
     # Training settings
     learning_rate: float = 1e-3
@@ -35,10 +36,10 @@ class NgramProbingConfig:
     num_val_tokens: int = int(1e6)
     
     # Output settings
-    output_dir: str = "results"
+    output_dir: str = os.path.join(os.path.dirname(__file__), "results")  # Put results in package directory
     histogram_bins: int = 20  # Number of bins for histograms
     
     def __post_init__(self):
-        # Convert token counts to sequence counts
-        self.num_train_sequences = self.num_train_tokens // self.ctx_len
-        self.num_val_sequences = self.num_val_tokens // self.ctx_len 
+        # Convert token counts to sequence counts using ceil division
+        self.num_train_sequences = math.ceil(self.num_train_tokens / self.ctx_len)
+        self.num_val_sequences = math.ceil(self.num_val_tokens / self.ctx_len) 

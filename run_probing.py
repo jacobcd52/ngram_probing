@@ -18,6 +18,8 @@ import seaborn as sns
 from config import NgramProbingConfig
 from probe_model import NgramProbe
 import pickle
+from sklearn.metrics import roc_auc_score
+import math
 
 class NgramProber:
     def __init__(self, config: NgramProbingConfig):
@@ -121,7 +123,8 @@ class NgramProber:
         if self.load_ngram_counts():
             return self.ngram_counts
             
-        all_ngrams = []
+        # Use running counter instead of accumulating all n-grams
+        ngram_counts = Counter()
         for batch_start in tqdm(range(0, len(tokens), self.config.model_batch_size), desc="Finding n-grams"):
             batch = tokens[batch_start:batch_start + self.config.model_batch_size].cpu().numpy()
             
@@ -130,14 +133,14 @@ class NgramProber:
                     tuple(seq[j:j + self.config.ngram_size].tolist())
                     for j in range(len(seq) - self.config.ngram_size + 1)
                 ]
-                all_ngrams.extend(seq_ngrams)
+                # Update counter directly instead of accumulating
+                ngram_counts.update(seq_ngrams)
             
             del batch
             if batch_start % (5 * self.config.model_batch_size) == 0:
                 torch.cuda.empty_cache()
         
-        ngram_counts = Counter(all_ngrams)
-        total_positions = len(all_ngrams)
+        total_positions = sum(ngram_counts.values())
         
         # Create frequency vs rank plot
         print("\nCreating frequency vs rank plot...")
@@ -156,13 +159,9 @@ class NgramProber:
         plt.xlabel("Rank (log scale)")
         plt.ylabel("Frequency % (log scale)")
         
-        # Add vertical lines for cutoffs
-        if self.config.ignore_top_n > 0:
-            plt.axvline(x=self.config.ignore_top_n, color='r', linestyle='--', alpha=0.5, 
-                       label=f'Ignore top {self.config.ignore_top_n}')
-        plt.axvline(x=self.config.top_m_ngrams + self.config.ignore_top_n, color='g', 
-                   linestyle='--', alpha=0.5, 
-                   label=f'Keep top {self.config.top_m_ngrams}')
+        # Add vertical lines for frequency thresholds
+        plt.axhline(y=1.0, color='r', linestyle='--', alpha=0.5, label='1% threshold')
+        plt.axhline(y=0.01, color='g', linestyle='--', alpha=0.5, label='0.01% threshold')
         
         plt.legend()
         
@@ -173,13 +172,24 @@ class NgramProber:
         plt.close()
         print(f"Saved frequency distribution plot to {plot_path}")
         
-        # Get top N+k n-grams, then remove top k
-        top_ngrams = ngram_counts.most_common(self.config.top_m_ngrams + self.config.ignore_top_n)[self.config.ignore_top_n:]
-        self.ngram_counts = dict(top_ngrams)
+        # Select n-grams based on frequency thresholds
+        selected_ngrams = []
+        for ngram, count in ngram_counts.most_common():
+            freq = count / total_positions * 100
+            if 0.01 <= freq <= 1.0:
+                selected_ngrams.append((ngram, count))
+                if len(selected_ngrams) >= 1000:
+                    break
         
-        # Store ignored n-grams for later use
-        if self.config.ignore_top_n > 0:
-            self.ignored_ngrams = dict(ngram_counts.most_common(self.config.ignore_top_n))
+        # Store selected n-grams
+        self.ngram_counts = dict(selected_ngrams)
+        
+        # Print information about selected n-grams
+        print(f"\nSelected {len(selected_ngrams)} n-grams:")
+        if selected_ngrams:
+            min_freq = selected_ngrams[-1][1] / total_positions * 100
+            max_freq = selected_ngrams[0][1] / total_positions * 100
+            print(f"Frequency range: {min_freq:.3f}% to {max_freq:.3f}%")
         
         self.save_ngram_counts()
         return self.ngram_counts
@@ -261,6 +271,71 @@ class NgramProber:
             chunk_idx += 1
         return chunk_idx
 
+    def compute_chunk_metrics(
+        self,
+        probe: NgramProbe,
+        chunk_logits: List[torch.Tensor],
+        chunk_labels: List[torch.Tensor],
+        ngrams: List[Tuple[int, ...]],
+        ngram_to_idx: Dict[Tuple[int, ...], int]
+    ) -> Dict[Tuple[int, ...], float]:
+        """Compute metrics for a chunk of predictions, returning AUROC scores for each n-gram."""
+        # Initialize arrays to store all true labels and predictions
+        all_true_labels = []
+        all_pred_probs = []
+        
+        # Process each batch's predictions with memory optimization
+        for batch_logits, batch_labels in zip(chunk_logits, chunk_labels):
+            probs = torch.sigmoid(batch_logits)
+            
+            # Process in smaller slices to reduce memory usage
+            slice_size = 100  # Reduced slice size for better memory management
+            for start_idx in range(0, batch_labels.shape[0], slice_size):
+                end_idx = min(start_idx + slice_size, batch_labels.shape[0])
+                
+                # Convert to float32 and move to CPU in smaller chunks
+                true_labels = batch_labels[start_idx:end_idx].to(dtype=torch.float32).cpu().numpy()
+                pred_probs = probs[start_idx:end_idx].to(dtype=torch.float32).cpu().numpy()
+                
+                # Append to lists
+                all_true_labels.append(true_labels)
+                all_pred_probs.append(pred_probs)
+                
+                del true_labels, pred_probs
+                torch.cuda.empty_cache()
+            
+            del probs
+            torch.cuda.empty_cache()
+        
+        # Concatenate all batches
+        all_true_labels = np.concatenate(all_true_labels, axis=0)
+        all_pred_probs = np.concatenate(all_pred_probs, axis=0)
+        
+        # Compute AUROC scores for all n-grams at once
+        auroc_scores = {}
+        for ngram in ngrams:
+            idx = ngram_to_idx[ngram]
+            if idx >= all_pred_probs.shape[-1]:
+                auroc_scores[ngram] = 0.5
+                continue
+            
+            try:
+                # Extract the specific n-gram's predictions and labels
+                true_labels = all_true_labels[..., idx].flatten()
+                pred_probs = all_pred_probs[..., idx].flatten()
+                
+                # Compute AUROC
+                auroc = roc_auc_score(true_labels, pred_probs)
+                auroc_scores[ngram] = auroc
+            except ValueError:
+                auroc_scores[ngram] = 0.5
+        
+        # Clear memory
+        del all_true_labels, all_pred_probs
+        torch.cuda.empty_cache()
+        
+        return auroc_scores
+
     def prepare_probe_data(
         self,
         tokens: torch.Tensor,
@@ -300,6 +375,10 @@ class NgramProber:
         ngram_to_idx: Dict[Tuple[int, ...], int]
     ) -> Dict[str, Dict[str, float]]:
         """Train both types of probes using chunked activations."""
+        print("\nStarting probe training:")
+        print(f"Number of n-grams selected: {len(ngrams)}")
+        print(f"Frequency range: {min(self.ngram_counts.values()) / (len(tokens) * self.config.ctx_len) * 100:.3f}% to {max(self.ngram_counts.values()) / (len(tokens) * self.config.ctx_len) * 100:.3f}%")
+        
         total_tokens = len(tokens) * self.config.ctx_len
         required_tokens = self.config.num_train_tokens + self.config.num_val_tokens
         if required_tokens > total_tokens:
@@ -308,25 +387,61 @@ class NgramProber:
         # Calculate total number of possible n-gram positions
         total_positions = total_tokens - (self.config.ngram_size - 1) * len(tokens)
         
-        # Print n-gram frequency information
-        print("\nN-gram frequency statistics:")
-        counts = list(self.ngram_counts.values())
-        max_freq = max(counts) / total_positions * 100
-        min_freq = min(counts) / total_positions * 100
-        print(f"Training on {len(ngrams)} n-grams:")
-        print(f"Most frequent included n-gram appears in {max_freq:.3f}% of positions")
-        print(f"Least frequent included n-gram appears in {min_freq:.3f}% of positions")
+        # Create frequency vs rank plot
+        print("\nCreating frequency vs rank plot...")
+        plt.figure(figsize=(12, 6))
         
-        # Print information about ignored n-grams
-        if hasattr(self, 'ignored_ngrams') and self.config.ignore_top_n > 0:
-            print(f"\nIgnored {self.config.ignore_top_n} most frequent n-grams:")
-            for ngram, count in self.ignored_ngrams.items():
-                freq = count / total_tokens * 100
-                print(f"N-gram: {self.model.to_string(torch.tensor(ngram))}, "
-                      f"frequency: {freq:.3f}%")
+        # Get all counts and sort them in descending order
+        counts = sorted(self.ngram_counts.values(), reverse=True)
+        if hasattr(self, 'ignored_ngrams'):
+            ignored_counts = sorted(self.ignored_ngrams.values(), reverse=True)
+            all_counts = ignored_counts + counts
+            frequencies = [count / total_positions * 100 for count in all_counts]
+            ranks = list(range(1, len(frequencies) + 1))
+            
+            # Plot ignored n-grams in red
+            plt.plot(ranks[:len(ignored_counts)], frequencies[:len(ignored_counts)], 
+                    'r-', alpha=0.7, linewidth=1, label='Ignored n-grams')
+            # Plot kept n-grams in blue
+            plt.plot(ranks[len(ignored_counts):], frequencies[len(ignored_counts):], 
+                    'b-', alpha=0.7, linewidth=1, label='Kept n-grams')
+        else:
+            frequencies = [count / total_positions * 100 for count in counts]
+            ranks = list(range(1, len(frequencies) + 1))
+            plt.plot(ranks, frequencies, 'b-', alpha=0.7, linewidth=1, label='All n-grams')
         
-        num_chunks = self.get_num_chunks()
-        train_chunks = num_chunks * self.config.num_train_sequences // len(tokens)
+        plt.yscale('log')
+        plt.xscale('log')
+        plt.grid(True, which="both", ls="-", alpha=0.2)
+        plt.title(f"N-gram Frequency Distribution (n={self.config.ngram_size})")
+        plt.xlabel("Rank (log scale)")
+        plt.ylabel("Frequency % (log scale)")
+        
+        # Add vertical lines for cutoffs
+        if self.config.ignore_top_n > 0:
+            plt.axvline(x=self.config.ignore_top_n, color='r', linestyle='--', alpha=0.5, 
+                       label=f'Ignore top {self.config.ignore_top_n}')
+        plt.axvline(x=self.config.top_m_ngrams + self.config.ignore_top_n, color='g', 
+                   linestyle='--', alpha=0.5, 
+                   label=f'Keep top {self.config.top_m_ngrams}')
+        
+        plt.legend()
+        
+        # Save plot
+        os.makedirs(os.path.join(self.config.output_dir, "plots"), exist_ok=True)
+        plot_path = os.path.join(self.config.output_dir, "plots", "ngram_frequency_distribution.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved frequency distribution plot to {plot_path}")
+        
+        # Print summary statistics
+        print(f"\nTraining on {len(ngrams)} n-grams")
+        print(f"Most frequent included n-gram appears in {frequencies[self.config.ignore_top_n]:.3f}% of positions")
+        print(f"Least frequent included n-gram appears in {frequencies[self.config.ignore_top_n + len(ngrams) - 1]:.3f}% of positions")
+        
+        # Calculate number of chunks needed for training and validation
+        num_train_chunks = math.ceil(self.config.num_train_sequences / self.config.chunk_size)
+        num_val_chunks = math.ceil(self.config.num_val_sequences / self.config.chunk_size)
         
         results = {}
         
@@ -342,7 +457,7 @@ class NgramProber:
             optimizer = torch.optim.Adam(probe.parameters(), lr=self.config.learning_rate)
             
             # Training loop with progress bar
-            pbar = tqdm(range(train_chunks), desc=f"Training {probe_type}-position probe")
+            pbar = tqdm(range(num_train_chunks), desc=f"Training {probe_type}-position probe")
             running_loss = 0
             num_batches = 0
             
@@ -381,16 +496,19 @@ class NgramProber:
             
             # Evaluation
             probe.eval()
-            all_logits = []
-            all_labels = []
             
             print(f"\nEvaluating {probe_type}-position probe...")
-            for chunk_idx in range(train_chunks, num_chunks):
+            # Initialize accumulators for AUROC scores
+            auroc_accumulator = {ngram: [] for ngram in ngrams}
+            
+            for chunk_idx in range(num_train_chunks, num_train_chunks + num_val_chunks):
                 activations = self.load_activations_chunk(chunk_idx)
                 if activations is None:
                     continue
                     
                 chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
+                chunk_logits = []
+                chunk_labels = []
                 
                 with torch.no_grad():
                     for i in tqdm(range(0, len(chunk_tokens), self.config.batch_size)):
@@ -403,26 +521,31 @@ class NgramProber:
                         )
                         logits = probe(activations_batch)
                         
-                        all_logits.append(logits.cpu())
-                        all_labels.append(labels.cpu())
+                        chunk_logits.append(logits.cpu())
+                        chunk_labels.append(labels.cpu())
                         
                         del activations_batch, labels, logits
                         torch.cuda.empty_cache()
                 
-                del activations
+                # Compute metrics for this chunk
+                chunk_results = self.compute_chunk_metrics(probe, chunk_logits, chunk_labels, ngrams, ngram_to_idx)
+                
+                # Accumulate AUROC scores
+                for ngram in ngrams:
+                    auroc_accumulator[ngram].append(chunk_results[ngram])
+                
+                del activations, chunk_logits, chunk_labels, chunk_results
                 torch.cuda.empty_cache()
             
-            logits = torch.cat(all_logits, dim=0)
-            labels = torch.cat(all_labels, dim=0)
-            aurocs = probe.compute_metrics(logits, labels)
-            
-            del logits, labels, all_logits, all_labels
-            torch.cuda.empty_cache()
+            # Average AUROC scores across chunks
+            results[probe_type] = {
+                ngram: np.mean(auroc_accumulator[ngram]) 
+                for ngram in ngrams
+            }
             
             # Save final model
             final_model_path = os.path.join(self.config.output_dir, f"probe_{probe_type}_final.pt")
             probe.save(final_model_path)
-            results[probe_type] = aurocs
         
         return results
     
@@ -525,31 +648,56 @@ def main():
         print(f"Error creating directories: {str(e)}")
         return
     
-    prober = NgramProber(config)
-    dataset = prober.load_dataset()
-    tokens = prober.get_tokens(dataset)
-    
-    ngrams = prober.get_ngrams(tokens)
-    ngram_list = list(ngrams.keys())
-    ngram_to_idx = {ngram: idx for idx, ngram in enumerate(ngram_list)}
-    
-    # Print information about ignored n-grams
-    if hasattr(prober, 'ignored_ngrams') and config.ignore_top_n > 0:
-        total_tokens = len(tokens) * config.ctx_len
-        print(f"\nIgnored {config.ignore_top_n} most frequent n-grams:")
-        for ngram, count in prober.ignored_ngrams.items():
-            freq = count / total_tokens * 100
-            print(f"N-gram: {prober.model.to_string(torch.tensor(ngram))}, "
-                  f"frequency: {freq:.3f}%")
-    
-    # Generate or load activations
-    activations = prober.load_activations_chunk(0)
-    if activations is None:
-        prober.generate_and_save_activations(tokens)
+    # Run for different n-gram sizes
+    for n in range(1, 10):
+        print(f"\n{'='*50}")
+        print(f"Running probing for n-gram size {n}")
+        print(f"{'='*50}")
+        
+        # Create a new config for this n-gram size
+        current_config = NgramProbingConfig()
+        current_config.ngram_size = n
+        current_config.output_dir = os.path.join(config.output_dir, f"n{n}")
+        
+        # Create necessary directories for this n-gram size
+        os.makedirs(current_config.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(current_config.output_dir, "plots"), exist_ok=True)
+        os.makedirs(os.path.join(current_config.output_dir, "cache"), exist_ok=True)
+        
+        prober = NgramProber(current_config)
+        dataset = prober.load_dataset()
+        tokens = prober.get_tokens(dataset)
+        
+        ngrams = prober.get_ngrams(tokens)
+        ngram_list = list(ngrams.keys())
+        ngram_to_idx = {ngram: idx for idx, ngram in enumerate(ngram_list)}
+        
+        # Print information about ignored n-grams
+        if hasattr(prober, 'ignored_ngrams') and current_config.ignore_top_n > 0:
+            total_tokens = len(tokens) * current_config.ctx_len
+            print(f"\nIgnored {current_config.ignore_top_n} most frequent n-grams:")
+            for ngram, count in prober.ignored_ngrams.items():
+                freq = count / total_tokens * 100
+                print(f"N-gram: {prober.model.to_string(torch.tensor(ngram))}, "
+                      f"frequency: {freq:.3f}%")
+        
+        # Generate or load activations
         activations = prober.load_activations_chunk(0)
+        if activations is None:
+            prober.generate_and_save_activations(tokens)
+            activations = prober.load_activations_chunk(0)
+        
+        results = prober.train_probe(tokens, ngram_list, ngram_to_idx)
+        prober.save_results(results, current_config.output_dir)
+        
+        print(f"\nCompleted n-gram size {n}")
+        print(f"Results saved to {current_config.output_dir}")
+        
+        # Clear memory
+        del prober, dataset, tokens, ngrams, ngram_list, ngram_to_idx, activations, results
+        torch.cuda.empty_cache()
     
-    results = prober.train_probe(tokens, ngram_list, ngram_to_idx)
-    prober.save_results(results, config.output_dir)
+    print("\nCompleted all n-gram sizes!")
 
 if __name__ == "__main__":
     main() 

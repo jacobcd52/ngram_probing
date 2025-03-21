@@ -15,21 +15,21 @@ class NgramProbe(nn.Module):
         ngrams: List[Tuple[int, ...]],
         device: str = "cuda",
         probe_type: str = "first",
-        dtype: str = "float32"
+        dtype: torch.dtype = torch.float32
     ):
         super().__init__()
         self.d_model = d_model
         self.ngrams = ngrams
         self.device = device
         self.probe_type = probe_type
-        self.dtype = getattr(torch, dtype)
+        self.dtype = dtype
         
         # Linear layer for prediction
-        self.linear = nn.Linear(d_model, len(ngrams))
+        self.linear = nn.Linear(d_model, len(ngrams)).to(device=device, dtype=dtype)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the probe."""
-        return self.linear(x)
+        return self.linear(x.to(dtype=self.dtype))
     
     def compute_loss(self, logits: torch.Tensor, labels: torch.Tensor, positive_weight: float = 1.0) -> torch.Tensor:
         """Compute binary cross-entropy loss with optional positive class weighting."""
@@ -39,7 +39,7 @@ class NgramProbe(nn.Module):
             pos_weight=torch.tensor([positive_weight], device=self.device, dtype=self.dtype)
         )
     
-    def compute_metrics(self, logits: torch.Tensor, labels: torch.Tensor) -> Dict[str, float]:
+    def compute_metrics(self, logits: torch.Tensor, labels: torch.Tensor) -> Dict[Tuple[int, ...], float]:
         """Compute AUROC for each n-gram."""
         probs = torch.sigmoid(logits)
         aurocs = {}
