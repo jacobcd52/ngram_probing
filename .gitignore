@@ -49,6 +49,7 @@ cache/
 jupyter/
 *.ipynb
 *.log
+nohup.out
 
 # Large data files
 *.csv

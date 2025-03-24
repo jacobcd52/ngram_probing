@@ -20,8 +20,32 @@ from probe_model import NgramProbe
 import pickle
 from sklearn.metrics import roc_auc_score
 import math
+import random
 
-class NgramProber:
+def get_pythia_config():
+    """Load or create and save the Pythia config."""
+    config_path = "pythia_config.pkl"
+    
+    if os.path.exists(config_path):
+        print("Loading saved Pythia config...")
+        with open(config_path, 'rb') as f:
+            return pickle.load(f)
+    
+    print("Loading Pythia model to get config...")
+    model = HookedTransformer.from_pretrained(
+        "EleutherAI/pythia-70m",
+        device="cpu",
+        fold_ln=False
+    )
+    config = model.cfg
+    
+    print("Saving Pythia config...")
+    with open(config_path, 'wb') as f:
+        pickle.dump(config, f)
+    
+    return config
+
+class SyntheticDataGenerator:
     def __init__(self, config: NgramProbingConfig):
         self.config = config
         self.model = HookedTransformer.from_pretrained(
@@ -344,10 +368,7 @@ class NgramProber:
 
     def prepare_probe_data(
         self,
-        tokens: torch.Tensor,
-        activations: torch.Tensor,
         ngrams: List[Tuple[int, ...]],
-        ngram_to_idx: Dict[Tuple[int, ...], int],
         probe_type: str
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare data for a specific probe type (first or final position)."""
@@ -451,40 +472,33 @@ class NgramProber:
             running_loss = 0
             num_batches = 0
             
-            for chunk_idx in pbar:
-                activations = self.load_activations_chunk(chunk_idx)
-                if activations is None:
-                    continue
+            # Create progress bar for training
+            pbar = tqdm(range(0, len(train_activations), self.config.probe_batch_size), 
+                       desc=f"Training batches")
+            
+            for i in pbar:
+                batch_end = min(i + self.config.probe_batch_size, len(train_activations))
+                batch_activations = train_activations[i:batch_end]
+                batch_labels = train_labels[i:batch_end]
                 
-                chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
+                logits = probe(batch_activations).squeeze(-1)  # Squeeze the last dimension
+                loss = probe.compute_loss(logits, batch_labels, self.config.positive_weight)
                 
-                for i in range(0, len(chunk_tokens), self.config.batch_size):
-                    batch_end = min(i + self.config.batch_size, len(chunk_tokens))
-                    batch_tokens = chunk_tokens[i:batch_end]
-                    batch_activations = activations[i:batch_end]
-                    
-                    activations_batch, labels = self.prepare_probe_data(
-                        batch_tokens, batch_activations, ngrams, ngram_to_idx, probe_type
-                    )
-                    
-                    logits = probe(activations_batch)
-                    loss = probe.compute_loss(logits, labels, self.config.positive_weight)
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
-                    running_loss = 0.9 * running_loss + 0.1 * loss.item() if num_batches > 0 else loss.item()
-                    num_batches += 1
-                    pbar.set_postfix({'loss': f'{running_loss:.4f}'})
-                    
-                    del activations_batch, labels, logits
-                    torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
                 
-                del activations
+                total_loss += loss.item()
+                num_batches += 1
+                
+                # Update progress bar with current loss
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                
+                # Clear memory after each batch
+                del logits, loss
                 torch.cuda.empty_cache()
             
-            # Evaluation
+            # Validation
             probe.eval()
             
             print(f"\nEvaluating {probe_type}-position probe...")
@@ -557,25 +571,12 @@ class NgramProber:
         
         return results
     
-    def save_results(self, results: Dict[str, Dict[str, float]], output_dir: str):
-        """Save results and create comparison plots."""
-        os.makedirs(output_dir, exist_ok=True)
-        plots_dir = os.path.join(output_dir, "plots")
-        os.makedirs(plots_dir, exist_ok=True)
-        
-        # Save results JSON
-        output_file = os.path.join(output_dir, "probe_results.json")
-        serializable_results = {
-            probe_type: {
-                str(ngram): {
-                    "auroc": stats,
-                    "count": self.ngram_counts[ngram]
-                } for ngram, stats in probe_results.items()
-            } for probe_type, probe_results in results.items()
-        }
-        
+    def save_results(self, results: Dict[str, List[Dict]]):
+        """Save results and create plots."""
+        # Save raw results
+        output_file = os.path.join(self.config.output_dir, "probe_results.json")
         with open(output_file, "w") as f:
-            json.dump(serializable_results, f, indent=2)
+            json.dump(results, f, indent=2)
         
         # Extract data for plotting
         first_log_errors = np.log10(1 - np.array(list(results['first'].values())))
