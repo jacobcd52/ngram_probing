@@ -13,27 +13,26 @@ class NgramProbingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     layer: int = -1  # -1 means last layer
     dtype: torch.dtype = torch.bfloat16  # Default to bfloat16 for efficiency
-    model_batch_size: int = 2048  # Batch size for model forward passes
+    model_batch_size: int = 512  # Batch size for model forward passes
     
     # Data settings
-    dataset_name: str = "roneneldan/TinyStories"
+    dataset_name: str = "kh4dien/fineweb-100m-sample"
     dataset_split: str = "train"
     max_texts: int = 200_000  # Default to 200k texts
-    ctx_len: int = 16
-    batch_size: int = 4096
+    ctx_len: int = 128
+    batch_size: int = 512
     chunk_size: int = 10_000  # Reduced from 50k to get more chunks
     
     # N-gram settings
     ngram_size: int = 3
-    top_m_ngrams: int = 100
-    ignore_top_n: int = 10  # Number of most frequent n-grams to ignore
+    top_m_ngrams: int = 1000
     
     # Training settings
     learning_rate: float = 1e-3
     num_epochs: int = 1
-    positive_weight: float = 100
+    positive_weight: float = 500
     num_train_tokens: int = int(10e6)
-    num_val_tokens: int = int(1e6)
+    num_val_tokens: int = int(10e6)
     
     # Output settings
     output_dir: str = os.path.join(os.path.dirname(__file__), "results")  # Put results in package directory
