@@ -410,6 +410,16 @@ class NgramProber:
         train_activations = []
         train_labels = []
         
+        # Calculate total number of batches for progress bar
+        total_batches = 0
+        for chunk_idx in range(num_train_chunks):
+            chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
+            total_batches += (len(chunk_tokens) + self.config.batch_size - 1) // self.config.batch_size
+        
+        # Create progress bar
+        pbar = tqdm(total=total_batches, desc="Training batches")
+        current_batch = 0
+        
         for chunk_idx in range(num_train_chunks):
             activations = self.load_activations_chunk(chunk_idx)
             if activations is None:
@@ -436,11 +446,18 @@ class NgramProber:
                 train_activations.append(activations_batch.cpu())
                 train_labels.append(labels.cpu())
                 
+                # Update progress bar with loss
+                current_batch += 1
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                pbar.update(1)
+                
                 del activations_batch, labels, logits
                 torch.cuda.empty_cache()
             
             del activations
             torch.cuda.empty_cache()
+        
+        pbar.close()
         
         # Validation
         probe.eval()
@@ -555,7 +572,7 @@ class NgramProber:
             plt.xlabel("Log10 Error Rate")
             plt.ylabel("Count")
             plt.legend()
-            plt.savefig(os.path.join(plots_dir, "log_error_rate_histogram.png"))
+            plt.savefig(os.path.join(plots_dir, f"log_error_rate_histogram_n{self.config.ngram_size}.png"))
         plt.close()
         
         # Create scatter plot with normalized frequencies
@@ -585,7 +602,7 @@ class NgramProber:
                 plt.plot(x_range, p(x_range), 'r--', alpha=0.8, label=f'Trend (R² = {r2:.3f})')
             
             plt.legend()
-            plt.savefig(os.path.join(plots_dir, "log_error_rate_vs_freq.png"))
+            plt.savefig(os.path.join(plots_dir, f"log_error_rate_vs_freq_n{self.config.ngram_size}.png"))
         plt.close()
 
     def generate_and_save_activations(self, tokens: torch.Tensor) -> None:

@@ -16,7 +16,7 @@ class NgramProbingConfig:
     model_batch_size: int = 512  # Batch size for model forward passes
     
     # Data settings
-    dataset_name: str = "kh4dien/fineweb-100m-sample"
+    dataset_name: str = "stas/openwebtext-10k" #"kh4dien/fineweb-100m-sample"
     dataset_split: str = "train"
     max_texts: int = 10_000  # Default to 100k texts
     ctx_len: int = 128
@@ -25,7 +25,7 @@ class NgramProbingConfig:
     
     # N-gram settings
     ngram_size: int = 3
-    top_m_ngrams: int = 1000
+    top_m_ngrams: int = 500
     
     # Training settings
     learning_rate: float = 1e-3
