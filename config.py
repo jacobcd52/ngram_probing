@@ -18,7 +18,7 @@ class NgramProbingConfig:
     # Data settings
     dataset_name: str = "kh4dien/fineweb-100m-sample"
     dataset_split: str = "train"
-    max_texts: int = 200_000  # Default to 200k texts
+    max_texts: int = 10_000  # Default to 100k texts
     ctx_len: int = 128
     batch_size: int = 512
     chunk_size: int = 10_000  # Reduced from 50k to get more chunks

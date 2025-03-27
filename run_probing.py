@@ -513,12 +513,24 @@ class NgramProber:
         
         return {'final': results}
     
-    def save_results(self, results: Dict[str, List[Dict]]):
+    def save_results(self, results: Dict[str, Dict[Tuple[int, ...], float]]):
         """Save results and create plots."""
+        # Convert tuple keys to strings for JSON serialization
+        json_results = {
+            'final': {
+                str(list(ngram)): score  # Convert tuple to list, then to string
+                for ngram, score in results['final'].items()
+            }
+        }
+        
         # Save raw results
         output_file = os.path.join(self.config.output_dir, "probe_results.json")
         with open(output_file, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(json_results, f, indent=2)
+        
+        # Create plots directory path
+        plots_dir = os.path.join(self.config.output_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
         
         # Extract data for plotting
         log_errors = np.log10(1 - np.array(list(results['final'].values())))
