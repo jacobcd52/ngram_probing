@@ -14,7 +14,7 @@ class NgramProbe(nn.Module):
         d_model: int,
         ngrams: List[Tuple[int, ...]],
         device: str = "cuda",
-        probe_type: str = "first",
+        probe_type: str = "final",
         dtype: torch.dtype = torch.float32
     ):
         super().__init__()
@@ -24,7 +24,7 @@ class NgramProbe(nn.Module):
         self.probe_type = probe_type
         self.dtype = dtype
         
-        # Linear layer for prediction
+        # Linear layer for prediction - one output per n-gram
         self.linear = nn.Linear(d_model, len(ngrams)).to(device=device, dtype=dtype)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:

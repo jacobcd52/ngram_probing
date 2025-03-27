@@ -20,6 +20,7 @@ from probe_model import NgramProbe
 import pickle
 from sklearn.metrics import roc_auc_score
 import math
+from torcheval.metrics import BinaryAUROC
 
 class NgramProber:
     def __init__(self, config: NgramProbingConfig):
@@ -274,73 +275,31 @@ class NgramProber:
         ngram_to_idx: Dict[Tuple[int, ...], int]
     ) -> Dict[Tuple[int, ...], float]:
         """Compute metrics for a chunk of predictions, returning AUROC scores for each n-gram."""
-        # Initialize arrays to store all true labels and predictions
-        all_true_labels = []
-        all_pred_probs = []
-        
-        # Process each batch's predictions with memory optimization
-        for batch_logits, batch_labels in zip(chunk_logits, chunk_labels):
-            probs = torch.sigmoid(batch_logits)
-            
-            # Process in smaller slices to reduce memory usage
-            slice_size = 100  # Reduced slice size for better memory management
-            for start_idx in range(0, batch_labels.shape[0], slice_size):
-                end_idx = min(start_idx + slice_size, batch_labels.shape[0])
-                
-                # Convert to float32 and move to CPU in smaller chunks
-                true_labels = batch_labels[start_idx:end_idx].to(dtype=torch.float32).cpu().numpy()
-                pred_probs = probs[start_idx:end_idx].to(dtype=torch.float32).cpu().numpy()
-                
-                # Append to lists
-                all_true_labels.append(true_labels)
-                all_pred_probs.append(pred_probs)
-                
-                del true_labels, pred_probs
-                torch.cuda.empty_cache()
-            
-            del probs
-            torch.cuda.empty_cache()
-        
         # Concatenate all batches
-        all_true_labels = np.concatenate(all_true_labels, axis=0)
-        all_pred_probs = np.concatenate(all_pred_probs, axis=0)
+        all_logits = torch.cat(chunk_logits, dim=0)  # [total_samples, seq_len, num_ngrams]
+        all_labels = torch.cat(chunk_labels, dim=0)   # [total_samples, seq_len, num_ngrams]
         
-        # Compute AUROC scores for all n-grams at once
-        auroc_scores = {}
-        for ngram in ngrams:
-            idx = ngram_to_idx[ngram]
-            if idx >= all_pred_probs.shape[-1]:
-                auroc_scores[ngram] = 0.5
-                continue
-            
-            try:
-                # Extract the specific n-gram's predictions and labels
-                true_labels = all_true_labels[..., idx].flatten()
-                pred_probs = all_pred_probs[..., idx].flatten()
-                
-                # Check if we have enough unique values for AUROC
-                unique_labels = np.unique(true_labels)
-                if len(unique_labels) < 2:
-                    auroc_scores[ngram] = 0.5
-                    continue
-                
-                # Check if we have enough samples
-                if len(true_labels) < 2:
-                    auroc_scores[ngram] = 0.5
-                    continue
-                
-                # Compute AUROC
-                auroc = roc_auc_score(true_labels, pred_probs)
-                auroc_scores[ngram] = auroc
-                
-            except (ValueError, IndexError) as e:
-                auroc_scores[ngram] = 0.5
+        # Flatten batch and sequence dimensions
+        batch_size, seq_len, num_ngrams = all_logits.shape
+        flat_logits = all_logits.reshape(-1, num_ngrams)  # [(batch_size * seq_len), num_ngrams]
+        flat_labels = all_labels.reshape(-1, num_ngrams)   # [(batch_size * seq_len), num_ngrams]
         
-        # Clear memory
-        del all_true_labels, all_pred_probs
-        torch.cuda.empty_cache()
+        # Convert logits to probabilities
+        probs = torch.sigmoid(flat_logits)
         
-        return auroc_scores
+        # Transpose to get shape [num_ngrams, num_samples] as required by BinaryAUROC
+        probs = probs.T
+        labels = flat_labels.T
+        
+        # Create metric
+        metric = BinaryAUROC(num_tasks=num_ngrams, device=self.config.device)
+        
+        # Update and compute
+        metric.update(probs, labels)
+        auroc_scores = metric.compute()
+        
+        # Create dictionary mapping n-grams to their AUROC scores
+        return {ngram: score.item() for ngram, score in zip(ngrams, auroc_scores)}
 
     def prepare_probe_data(
         self,
@@ -380,7 +339,7 @@ class NgramProber:
         ngrams: List[Tuple[int, ...]],
         ngram_to_idx: Dict[Tuple[int, ...], int]
     ) -> Dict[str, Dict[str, float]]:
-        """Train both types of probes using chunked activations."""
+        """Train final-position probe using chunked activations."""
         total_tokens = len(tokens) * self.config.ctx_len
         required_tokens = self.config.num_train_tokens + self.config.num_val_tokens
         if required_tokens > total_tokens:
@@ -430,245 +389,191 @@ class NgramProber:
         print(f"Least frequent n-gram appears in {frequencies[-1]:.2e} of positions")
         
         # Calculate number of chunks needed for training and validation
-        num_train_chunks = math.ceil(self.config.num_train_sequences / self.config.chunk_size)
-        num_val_chunks = math.ceil(self.config.num_val_sequences / self.config.chunk_size)
+        num_train_sequences = math.ceil(self.config.num_train_tokens / self.config.ctx_len)
+        num_val_sequences = math.ceil(self.config.num_val_tokens / self.config.ctx_len)
+        num_train_chunks = math.ceil(num_train_sequences / self.config.chunk_size)
+        num_val_chunks = math.ceil(num_val_sequences / self.config.chunk_size)
         
-        results = {}
+        # Create probe for final position
+        probe = NgramProbe(
+            d_model=self.model.cfg.d_model,
+            ngrams=ngrams,
+            device=self.config.device,
+            probe_type='final',
+            dtype=self.config.dtype
+        ).to(self.config.device)
         
-        for probe_type in ['first', 'final']:
-            probe = NgramProbe(
-                d_model=self.model.cfg.d_model,
-                ngrams=ngrams,
-                device=self.config.device,
-                probe_type=probe_type,
-                dtype=self.config.dtype
-            ).to(self.config.device)
+        optimizer = torch.optim.Adam(probe.parameters(), lr=self.config.learning_rate)
+        
+        # Load and prepare training data
+        print("\nLoading training data for final-position probe...")
+        train_activations = []
+        train_labels = []
+        
+        for chunk_idx in range(num_train_chunks):
+            activations = self.load_activations_chunk(chunk_idx)
+            if activations is None:
+                continue
             
-            optimizer = torch.optim.Adam(probe.parameters(), lr=self.config.learning_rate)
+            chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
             
-            # Training loop with progress bar
-            pbar = tqdm(range(self.get_num_chunks()), desc=f"Training {probe_type}-position probe")
-            running_loss = 0
-            num_batches = 0
-            
-            for chunk_idx in pbar:
-                activations = self.load_activations_chunk(chunk_idx)
-                if activations is None:
-                    continue
+            for i in range(0, len(chunk_tokens), self.config.batch_size):
+                batch_end = min(i + self.config.batch_size, len(chunk_tokens))
+                batch_tokens = chunk_tokens[i:batch_end]
+                batch_activations = activations[i:batch_end]
                 
-                chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
+                activations_batch, labels = self.prepare_probe_data(
+                    batch_tokens, batch_activations, ngrams, ngram_to_idx, 'final'
+                )
                 
-                for i in range(0, len(chunk_tokens), self.config.batch_size):
+                logits = probe(activations_batch)
+                loss = probe.compute_loss(logits, labels, self.config.positive_weight)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                train_activations.append(activations_batch.cpu())
+                train_labels.append(labels.cpu())
+                
+                del activations_batch, labels, logits
+                torch.cuda.empty_cache()
+            
+            del activations
+            torch.cuda.empty_cache()
+        
+        # Validation
+        probe.eval()
+        
+        print("\nEvaluating final-position probe...")
+        print(f"Number of chunks to evaluate: {self.get_num_chunks()}")
+        auroc_accumulator = {ngram: [] for ngram in ngrams}
+        
+        for chunk_idx in range(self.get_num_chunks()):
+            print(f"\nProcessing evaluation chunk {chunk_idx + 1}/{self.get_num_chunks()}")
+            activations = self.load_activations_chunk(chunk_idx)
+            if activations is None:
+                print(f"Warning: Could not load chunk {chunk_idx}, skipping...")
+                continue
+                
+            chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
+            print(f"Chunk tokens shape: {chunk_tokens.shape}")
+            chunk_logits = []
+            chunk_labels = []
+            
+            with torch.no_grad():
+                for i in tqdm(range(0, len(chunk_tokens), self.config.batch_size)):
                     batch_end = min(i + self.config.batch_size, len(chunk_tokens))
                     batch_tokens = chunk_tokens[i:batch_end]
                     batch_activations = activations[i:batch_end]
                     
                     activations_batch, labels = self.prepare_probe_data(
-                        batch_tokens, batch_activations, ngrams, ngram_to_idx, probe_type
+                        batch_tokens, batch_activations, ngrams, ngram_to_idx, 'final'
                     )
-                    
                     logits = probe(activations_batch)
-                    loss = probe.compute_loss(logits, labels, self.config.positive_weight)
                     
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
-                    running_loss = 0.9 * running_loss + 0.1 * loss.item() if num_batches > 0 else loss.item()
-                    num_batches += 1
-                    pbar.set_postfix({'loss': f'{running_loss:.4f}'})
+                    chunk_logits.append(logits.cpu())
+                    chunk_labels.append(labels.cpu())
                     
                     del activations_batch, labels, logits
                     torch.cuda.empty_cache()
-                
-                del activations
-                torch.cuda.empty_cache()
             
-            # Evaluation
-            probe.eval()
+            print(f"Number of logit batches: {len(chunk_logits)}")
+            print(f"Number of label batches: {len(chunk_labels)}")
             
-            print(f"\nEvaluating {probe_type}-position probe...")
-            print(f"Number of chunks to evaluate: {self.get_num_chunks()}")
-            # Initialize accumulators for AUROC scores
-            auroc_accumulator = {ngram: [] for ngram in ngrams}
+            # Compute metrics for this chunk
+            print(f"\nComputing metrics for chunk {chunk_idx}...")
+            chunk_results = self.compute_chunk_metrics(probe, chunk_logits, chunk_labels, ngrams, ngram_to_idx)
             
-            for chunk_idx in range(self.get_num_chunks()):
-                print(f"\nProcessing evaluation chunk {chunk_idx + 1}/{self.get_num_chunks()}")
-                activations = self.load_activations_chunk(chunk_idx)
-                if activations is None:
-                    print(f"Warning: Could not load chunk {chunk_idx}, skipping...")
-                    continue
-                    
-                chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
-                print(f"Chunk tokens shape: {chunk_tokens.shape}")
-                chunk_logits = []
-                chunk_labels = []
-                
-                with torch.no_grad():
-                    for i in tqdm(range(0, len(chunk_tokens), self.config.batch_size)):
-                        batch_end = min(i + self.config.batch_size, len(chunk_tokens))
-                        batch_tokens = chunk_tokens[i:batch_end]
-                        batch_activations = activations[i:batch_end]
-                        
-                        activations_batch, labels = self.prepare_probe_data(
-                            batch_tokens, batch_activations, ngrams, ngram_to_idx, probe_type
-                        )
-                        logits = probe(activations_batch)
-                        
-                        chunk_logits.append(logits.cpu())
-                        chunk_labels.append(labels.cpu())
-                        
-                        del activations_batch, labels, logits
-                        torch.cuda.empty_cache()
-                
-                print(f"Number of logit batches: {len(chunk_logits)}")
-                print(f"Number of label batches: {len(chunk_labels)}")
-                
-                # Compute metrics for this chunk
-                print(f"\nComputing metrics for chunk {chunk_idx}...")
-                chunk_results = self.compute_chunk_metrics(probe, chunk_logits, chunk_labels, ngrams, ngram_to_idx)
-                
-                # Accumulate AUROC scores
-                for ngram in ngrams:
-                    auroc_accumulator[ngram].append(chunk_results[ngram])
-                
-                print(f"Completed chunk {chunk_idx} evaluation")
-                del activations, chunk_logits, chunk_labels, chunk_results
-                torch.cuda.empty_cache()
+            # Accumulate AUROC scores
+            for ngram in ngrams:
+                auroc_accumulator[ngram].append(chunk_results[ngram])
             
-            print(f"\nComputing final {probe_type}-position probe results...")
-            # Average AUROC scores across chunks
-            results[probe_type] = {
-                ngram: np.mean(auroc_accumulator[ngram]) 
-                for ngram in ngrams
-            }
-            
-            # Print some summary statistics
-            auroc_scores = list(results[probe_type].values())
-            print(f"Number of n-grams with valid AUROC scores: {len(auroc_scores)}")
-            print(f"Mean AUROC score: {np.mean(auroc_scores):.4f}")
-            print(f"Min AUROC score: {np.min(auroc_scores):.4f}")
-            print(f"Max AUROC score: {np.max(auroc_scores):.4f}")
-            
-            # Save final model
-            final_model_path = os.path.join(self.config.output_dir, f"probe_{probe_type}_final.pt")
-            probe.save(final_model_path)
-            print(f"Saved final model to {final_model_path}")
+            print(f"Completed chunk {chunk_idx} evaluation")
+            del activations, chunk_logits, chunk_labels, chunk_results
+            torch.cuda.empty_cache()
         
-        return results
-    
-    def save_results(self, results: Dict[str, Dict[str, float]], output_dir: str):
-        """Save results and create comparison plots."""
-        os.makedirs(output_dir, exist_ok=True)
-        plots_dir = os.path.join(output_dir, "plots")
-        os.makedirs(plots_dir, exist_ok=True)
-        
-        # Save results JSON
-        output_file = os.path.join(output_dir, "probe_results.json")
-        serializable_results = {
-            probe_type: {
-                str(ngram): {
-                    "auroc": stats,
-                    "count": self.ngram_counts[ngram]
-                } for ngram, stats in probe_results.items()
-            } for probe_type, probe_results in results.items()
+        print("\nComputing final probe results...")
+        results = {
+            ngram: np.mean(auroc_accumulator[ngram]) 
+            for ngram in ngrams
         }
         
+        # Print summary statistics
+        auroc_scores = list(results.values())
+        print(f"Number of n-grams with valid AUROC scores: {len(auroc_scores)}")
+        print(f"Mean AUROC score: {np.mean(auroc_scores):.4f}")
+        print(f"Min AUROC score: {np.min(auroc_scores):.4f}")
+        print(f"Max AUROC score: {np.max(auroc_scores):.4f}")
+        
+        # Save final model
+        final_model_path = os.path.join(self.config.output_dir, "probe_final.pt")
+        probe.save(final_model_path)
+        print(f"Saved final model to {final_model_path}")
+        
+        return {'final': results}
+    
+    def save_results(self, results: Dict[str, List[Dict]]):
+        """Save results and create plots."""
+        # Save raw results
+        output_file = os.path.join(self.config.output_dir, "probe_results.json")
         with open(output_file, "w") as f:
-            json.dump(serializable_results, f, indent=2)
+            json.dump(results, f, indent=2)
         
         # Extract data for plotting
-        first_log_errors = np.log10(1 - np.array(list(results['first'].values())))
-        final_log_errors = np.log10(1 - np.array(list(results['final'].values())))
+        log_errors = np.log10(1 - np.array(list(results['final'].values())))
         
         # Calculate normalized frequencies
         total_tokens = len(self.tokens) * self.config.ctx_len
-        counts = np.array([self.ngram_counts[ngram] for ngram in results['first'].keys()])
+        counts = np.array([self.ngram_counts[ngram] for ngram in results['final'].keys()])
         frequencies = counts / total_tokens
         log_frequencies = np.log10(frequencies)
         
-        # Create histogram with consistent bins
+        # Create histogram
         plt.figure(figsize=(12, 6))
         
-        # Calculate common bins based on all log error rates
-        all_log_errors = np.concatenate([first_log_errors, final_log_errors])
-        valid_log_errors = all_log_errors[~np.isnan(all_log_errors) & ~np.isinf(all_log_errors)]
+        # Calculate bins based on log error rates
+        valid_log_errors = log_errors[~np.isnan(log_errors) & ~np.isinf(log_errors)]
         
         if len(valid_log_errors) > 0:
             bins = np.linspace(min(valid_log_errors), max(valid_log_errors), self.config.histogram_bins)
             
-            # Filter out NaN and inf values before plotting
-            first_valid = first_log_errors[~np.isnan(first_log_errors) & ~np.isinf(first_log_errors)]
-            final_valid = final_log_errors[~np.isnan(final_log_errors) & ~np.isinf(final_log_errors)]
-            
-            if len(first_valid) > 0 and len(final_valid) > 0:
-                plt.hist(first_valid, bins=bins, alpha=0.5, label='First Position')
-                plt.hist(final_valid, bins=bins, alpha=0.5, label='Final Position')
-                plt.title("Distribution of Log10 Error Rates (log10(1 - AUROC)) by Probe Type")
-                plt.xlabel("Log10 Error Rate")
-                plt.ylabel("Count")
-                plt.legend()
-                plt.savefig(os.path.join(plots_dir, "log_error_rate_histogram_comparison.png"))
+            plt.hist(valid_log_errors, bins=bins, alpha=0.5, label='Final Position')
+            plt.title("Distribution of Log10 Error Rates (log10(1 - AUROC))")
+            plt.xlabel("Log10 Error Rate")
+            plt.ylabel("Count")
+            plt.legend()
+            plt.savefig(os.path.join(plots_dir, "log_error_rate_histogram.png"))
         plt.close()
         
         # Create scatter plot with normalized frequencies
         plt.figure(figsize=(12, 6))
         
         # Filter out invalid values
-        valid_mask = ~np.isnan(log_frequencies) & ~np.isnan(first_log_errors) & ~np.isnan(final_log_errors) & \
-                    ~np.isinf(log_frequencies) & ~np.isinf(first_log_errors) & ~np.isinf(final_log_errors)
+        valid_mask = ~np.isnan(log_frequencies) & ~np.isnan(log_errors) & \
+                    ~np.isinf(log_frequencies) & ~np.isinf(log_errors)
         
         if np.sum(valid_mask) > 0:
-            plt.scatter(log_frequencies[valid_mask], first_log_errors[valid_mask], alpha=0.5, label='First Position')
-            plt.scatter(log_frequencies[valid_mask], final_log_errors[valid_mask], alpha=0.5, label='Final Position')
-            plt.title("Log10 Error Rate vs Log10 Frequency by Probe Type")
+            plt.scatter(log_frequencies[valid_mask], log_errors[valid_mask], alpha=0.5, label='Final Position')
+            plt.title("Log10 Error Rate vs Log10 Frequency")
             plt.xlabel("Log10 Frequency (log10(occurrences / total tokens))")
             plt.ylabel("Log10 Error Rate (log10(1 - AUROC))")
             plt.legend()
             
-            # Add trend lines with R² values
-            for log_errors, style, label in [(first_log_errors, 'r--', 'First Position'), 
-                                           (final_log_errors, 'b--', 'Final Position')]:
-                # Linear fit in log-log space
-                valid_x = log_frequencies[valid_mask]
-                valid_y = log_errors[valid_mask]
+            # Add trend line with R² value
+            valid_x = log_frequencies[valid_mask]
+            valid_y = log_errors[valid_mask]
+            
+            if len(valid_x) > 1 and len(valid_y) > 1:
+                z = np.polyfit(valid_x, valid_y, 1)
+                p = np.poly1d(z)
+                r2 = np.corrcoef(valid_x, valid_y)[0,1]**2
                 
-                if len(valid_x) > 1 and len(valid_y) > 1:
-                    z = np.polyfit(valid_x, valid_y, 1)
-                    p = np.poly1d(z)
-                    r2 = np.corrcoef(valid_x, valid_y)[0,1]**2
-                    
-                    # Plot trend line
-                    x_range = np.linspace(valid_x.min(), valid_x.max(), 100)
-                    plt.plot(x_range, p(x_range), style, alpha=0.8, label=f'{label} (R² = {r2:.3f})')
+                x_range = np.linspace(valid_x.min(), valid_x.max(), 100)
+                plt.plot(x_range, p(x_range), 'r--', alpha=0.8, label=f'Trend (R² = {r2:.3f})')
             
             plt.legend()
-            plt.savefig(os.path.join(plots_dir, "log_error_rate_vs_freq_comparison.png"))
-        plt.close()
-        
-        # Create direct comparison scatter plot
-        plt.figure(figsize=(8, 8))
-        
-        # Filter out invalid values for comparison plot
-        valid_mask = ~np.isnan(first_log_errors) & ~np.isnan(final_log_errors) & \
-                    ~np.isinf(first_log_errors) & ~np.isinf(final_log_errors)
-        
-        if np.sum(valid_mask) > 0:
-            valid_first = first_log_errors[valid_mask]
-            valid_final = final_log_errors[valid_mask]
-            
-            plt.scatter(valid_first, valid_final, alpha=0.5)
-            plt.plot([min(valid_first), max(valid_first)], 
-                    [min(valid_first), max(valid_first)], 'r--', alpha=0.8)
-            plt.title("First Position vs Final Position Log10 Error Rates")
-            plt.xlabel("First Position Log10 Error Rate (log10(1 - AUROC))")
-            plt.ylabel("Final Position Log10 Error Rate (log10(1 - AUROC))")
-            
-            correlation = np.corrcoef(valid_first, valid_final)[0, 1]
-            plt.text(0.05, 0.95, f'Correlation: {correlation:.3f}', 
-                     transform=plt.gca().transAxes)
-            
-            plt.savefig(os.path.join(plots_dir, "first_vs_final_log_error_rate.png"))
+            plt.savefig(os.path.join(plots_dir, "log_error_rate_vs_freq.png"))
         plt.close()
 
     def generate_and_save_activations(self, tokens: torch.Tensor) -> None:
@@ -778,7 +683,7 @@ def main():
         
         # Train probe using the pre-generated activations
         results = current_prober.train_probe(tokens, ngram_list, ngram_to_idx)
-        current_prober.save_results(results, current_config.output_dir)
+        current_prober.save_results(results)
         
         print(f"\nCompleted n-gram size {n}")
         print(f"Results saved to {current_config.output_dir}")

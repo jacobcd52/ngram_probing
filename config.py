@@ -31,8 +31,8 @@ class NgramProbingConfig:
     learning_rate: float = 1e-3
     num_epochs: int = 1
     positive_weight: float = 500
-    num_train_tokens: int = int(10e6)
-    num_val_tokens: int = int(10e6)
+    num_train_tokens: int = int(1e6)
+    num_val_tokens: int = int(1e6)
     
     # Output settings
     output_dir: str = os.path.join(os.path.dirname(__file__), "results")  # Put results in package directory
