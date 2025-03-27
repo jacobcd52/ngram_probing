@@ -38,7 +38,5 @@ class NgramProbingConfig:
     output_dir: str = os.path.join(os.path.dirname(__file__), "results")  # Put results in package directory
     histogram_bins: int = 20  # Number of bins for histograms
     
-    def __post_init__(self):
-        # Convert token counts to sequence counts using ceil division
-        self.num_train_sequences = math.ceil(self.num_train_tokens / self.ctx_len)
-        self.num_val_sequences = math.ceil(self.num_val_tokens / self.ctx_len) 
+    # New validation_split parameter
+    validation_split: float = 0.1  # Ratio of data to use for validation 
