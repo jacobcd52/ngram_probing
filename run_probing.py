@@ -82,9 +82,11 @@ class NgramProber:
                 return False
                 
             self.ngram_counts = data['ngram_counts']
+            
             return True
             
         except Exception as e:
+            print(f"Error loading n-grams: {str(e)}")
             return False
         
     def load_dataset(self):
@@ -101,7 +103,7 @@ class NgramProber:
         os.makedirs(cache_dir, exist_ok=True)
         base_path = os.path.join(cache_dir, "cached_tokens")
         
-        # Check if all chunks exist
+        # Check if all chunks exist and are valid
         if not force_recompute:
             chunk_idx = 0
             all_chunks_exist = True
@@ -111,18 +113,19 @@ class NgramProber:
                     break
                 chunk_idx += 1
             if chunk_idx > 0:
-                # Load all chunks
-                chunks = []
+                # Verify all chunks are valid
                 for i in range(chunk_idx):
-                    chunk_path = f"{base_path}_chunk{i}.pt"
-                    chunks.append(torch.load(chunk_path))
-                self.tokens = torch.cat(chunks, dim=0)
-                return self.tokens
+                    chunk = self.load_tokens_chunk(i)
+                    if chunk is None:
+                        all_chunks_exist = False
+                        break
+                if all_chunks_exist:
+                    print(f"Found {chunk_idx} valid token chunks")
+                    return None  # Return None to indicate we're using chunked loading
         
         # Tokenize in chunks
         chunk_size = 10000  # Process 10k texts at a time
         num_chunks = (len(dataset) + chunk_size - 1) // chunk_size
-        all_tokens = []
         
         print(f"\nTokenizing {len(dataset)} texts in {num_chunks} chunks...")
         for chunk_idx in tqdm(range(num_chunks)):
@@ -141,24 +144,36 @@ class NgramProber:
             chunk_path = f"{base_path}_chunk{chunk_idx}.pt"
             torch.save(chunk_tokens, chunk_path)
             
-            all_tokens.append(chunk_tokens)
-            
             # Clear memory
             del chunk_tokens
             torch.cuda.empty_cache()
         
-        # Combine all chunks
-        self.tokens = torch.cat(all_tokens, dim=0)
-        return self.tokens
+        print(f"Saved {num_chunks} token chunks")
+        return None  # Return None to indicate we're using chunked loading
         
-    def get_ngrams(self, tokens: torch.Tensor) -> Dict[str, int]:
+    def get_ngrams(self, tokens: Optional[torch.Tensor] = None) -> Dict[str, int]:
         """Extract n-grams from tokenized texts."""
         if self.load_ngram_counts():
             return self.ngram_counts
-            
-        # Calculate total number of possible n-gram positions
-        total_tokens = len(tokens) * self.config.ctx_len
-        total_positions = total_tokens - (self.config.ngram_size - 1) * len(tokens)
+        
+        # Count total tokens and positions across all chunks
+        total_tokens = 0
+        total_positions = 0
+        chunk_idx = 0
+        
+        # First pass: count total tokens and positions
+        while True:
+            chunk = self.load_tokens_chunk(chunk_idx)
+            if chunk is None:
+                break
+            total_tokens += len(chunk)
+            total_positions += len(chunk) * self.config.ctx_len - (self.config.ngram_size - 1) * len(chunk)
+            chunk_idx += 1
+        
+        if chunk_idx == 0:
+            raise ValueError("No token chunks found! Run get_tokens() first.")
+        
+        total_positions = total_tokens * self.config.ctx_len - (self.config.ngram_size - 1) * total_tokens
         
         # Use running counter with frequency-based filtering
         ngram_counts = Counter()
@@ -166,25 +181,39 @@ class NgramProber:
         max_count = int(1e-2 * total_positions)  # Maximum count allowed by frequency threshold
         
         print(f"\nCounting n-grams (filtering counts between {min_count} and {max_count})...")
-        for batch_start in tqdm(range(0, len(tokens), self.config.model_batch_size), desc="Finding n-grams"):
-            batch = tokens[batch_start:batch_start + self.config.model_batch_size].cpu().numpy()
+        
+        # Second pass: count n-grams
+        for chunk_idx in tqdm(range(chunk_idx), desc="Processing chunks"):
+            chunk = self.load_tokens_chunk(chunk_idx)
+            if chunk is None:
+                continue
             
-            for seq in batch:
-                # Only count n-grams that could potentially meet our frequency thresholds
-                seq_ngrams = [
-                    tuple(seq[j:j + self.config.ngram_size].tolist())
-                    for j in range(len(seq) - self.config.ngram_size + 1)
-                ]
+            for batch_start in range(0, len(chunk), self.config.model_batch_size):
+                batch_end = min(batch_start + self.config.model_batch_size, len(chunk))
+                batch = chunk[batch_start:batch_end].cpu().numpy()
                 
-                # Update counter with filtering
-                for ngram in seq_ngrams:
-                    current_count = ngram_counts[ngram]
-                    if current_count < max_count:  # Only count if below max threshold
-                        ngram_counts[ngram] = current_count + 1
+                for seq in batch:
+                    # Only count n-grams that could potentially meet our frequency thresholds
+                    seq_ngrams = [
+                        tuple(seq[j:j + self.config.ngram_size].tolist())
+                        for j in range(len(seq) - self.config.ngram_size + 1)
+                    ]
+                    
+                    # Update counter with filtering
+                    for ngram in seq_ngrams:
+                        current_count = ngram_counts[ngram]
+                        if current_count < max_count:  # Only count if below max threshold
+                            ngram_counts[ngram] = current_count + 1
+                
+                del batch
+                if batch_start % (5 * self.config.model_batch_size) == 0:
+                    torch.cuda.empty_cache()
             
-            del batch
-            if batch_start % (5 * self.config.model_batch_size) == 0:
-                torch.cuda.empty_cache()
+            del chunk
+            torch.cuda.empty_cache()
+        
+        print(f"\nDebug: Found {len(ngram_counts)} unique n-grams")
+        print(f"First few n-grams and their counts: {list(ngram_counts.most_common())[:5]}")
         
         # Filter n-grams by frequency thresholds
         selected_ngrams = []
@@ -194,15 +223,66 @@ class NgramProber:
                 if len(selected_ngrams) >= self.config.top_m_ngrams:
                     break
         
+        print(f"\nDebug: Selected {len(selected_ngrams)} n-grams after frequency filtering")
+        print(f"First few selected n-grams: {selected_ngrams[:5]}")
+        
         # Store selected n-grams
         self.ngram_counts = dict(selected_ngrams)
         
         # Print information about selected n-grams
         print(f"\nSelected {len(selected_ngrams)} n-grams:")
-        if selected_ngrams:
-            min_freq = selected_ngrams[-1][1] / total_positions
-            max_freq = selected_ngrams[0][1] / total_positions
-            print(f"Frequency range: {min_freq:.2e} to {max_freq:.2e}")
+        frequencies = [count / total_positions for ngram, count in selected_ngrams]
+        min_freq = frequencies[-1]
+        max_freq = frequencies[0]
+        print(f"Frequency range: {min_freq:.2e} to {max_freq:.2e}")
+        
+        # If union_size > 1, create sets of n-grams with similar frequencies
+        if self.config.union_size > 1:
+            print(f"\nCreating sets of {self.config.union_size} n-grams with similar frequencies...")
+            ngram_sets = []
+            used_ngrams = set()
+            
+            # Sort n-grams by frequency for easier processing
+            sorted_ngrams = sorted(selected_ngrams, key=lambda x: x[1], reverse=True)
+            
+            for i, (base_ngram, base_count) in enumerate(sorted_ngrams):
+                if base_ngram in used_ngrams:
+                    continue
+                    
+                # Create a set starting with this n-gram
+                current_set = [base_ngram]
+                used_ngrams.add(base_ngram)
+                
+                # Look for other n-grams with similar frequencies
+                for j, (candidate_ngram, candidate_count) in enumerate(sorted_ngrams[i+1:], start=i+1):
+                    if candidate_ngram in used_ngrams:
+                        continue
+                        
+                    # Check if frequencies are within the allowed ratio
+                    if (base_count / candidate_count <= self.config.frequency_ratio and 
+                        candidate_count / base_count <= self.config.frequency_ratio):
+                        current_set.append(candidate_ngram)
+                        used_ngrams.add(candidate_ngram)
+                        
+                        if len(current_set) == self.config.union_size:
+                            break
+                
+                if len(current_set) == self.config.union_size:
+                    ngram_sets.append(tuple(current_set))  # Convert list to tuple
+            
+            print(f"Created {len(ngram_sets)} sets of {self.config.union_size} n-grams")
+            print(f"First few sets: {ngram_sets[:5]}")
+            
+            # Update ngram_counts to use sets as keys
+            new_ngram_counts = {}
+            for ngram_set in ngram_sets:
+                # Use the tuple of n-grams as the key
+                new_ngram_counts[ngram_set] = sum(self.ngram_counts[ngram] for ngram in ngram_set)
+            
+            self.ngram_counts = new_ngram_counts
+            print(f"\nDebug: Final n-gram sets and their counts: {list(self.ngram_counts.items())[:5]}")
+            print(f"Debug: Type of first n-gram set: {type(list(self.ngram_counts.keys())[0])}")
+            print(f"Debug: Length of first n-gram set: {len(list(self.ngram_counts.keys())[0])}")
         
         self.save_ngram_counts()
         return self.ngram_counts
@@ -299,7 +379,16 @@ class NgramProber:
         auroc_scores = metric.compute()
         
         # Create dictionary mapping n-grams to their AUROC scores
-        return {ngram: score.item() for ngram, score in zip(ngrams, auroc_scores)}
+        results = {ngram: score.item() for ngram, score in zip(ngrams, auroc_scores)}
+        
+        # Filter out invalid scores (NaN or Inf)
+        valid_results = {ngram: score for ngram, score in results.items() 
+                        if not (np.isnan(score) or np.isinf(score))}
+        
+        if len(valid_results) < len(results):
+            print(f"Warning: {len(results) - len(valid_results)} n-grams had invalid AUROC scores")
+        
+        return valid_results
 
     def prepare_probe_data(
         self,
@@ -312,22 +401,47 @@ class NgramProber:
         """Prepare data for a specific probe type (first or final position)."""
         batch_size, seq_len, d_model = activations.shape
         
+        # Initialize labels tensor with zeros
         labels = torch.zeros((batch_size, seq_len, len(ngrams)), 
                            device=self.config.device,
                            dtype=self.config.dtype)
         
+        # For each sequence in the batch
         for b in range(batch_size):
+            sequence = tokens[b].cpu().tolist()
+            
+            # For each possible n-gram position in the sequence
             for j in range(seq_len - self.config.ngram_size + 1):
-                current_ngram = tuple(tokens[b, j:j + self.config.ngram_size].cpu().tolist())
-                if current_ngram in ngram_to_idx:
-                    pos = j if probe_type == 'first' else j + self.config.ngram_size - 1
-                    labels[b, pos, ngram_to_idx[current_ngram]] = 1
+                # Get the current n-gram
+                current_ngram = tuple(sequence[j:j + self.config.ngram_size])
+                
+                # Check if this n-gram is part of any set
+                for set_idx, ngram_set in enumerate(ngrams):
+                    if isinstance(ngram_set, tuple):
+                        if len(ngram_set) > 0 and isinstance(ngram_set[0], tuple):
+                            # This is a set of n-grams
+                            for ngram in ngram_set:
+                                if current_ngram == ngram:
+                                    # For first position probe, use the start position
+                                    # For final position probe, use the end position
+                                    pos = j if probe_type == 'first' else j + self.config.ngram_size - 1
+                                    labels[b, pos, set_idx] = 1
+                                    break
+                        else:
+                            # This is a single n-gram
+                            if current_ngram == ngram_set:
+                                pos = j if probe_type == 'first' else j + self.config.ngram_size - 1
+                                labels[b, pos, set_idx] = 1
         
+        # Determine valid positions based on probe type
         if probe_type == 'first':
+            # For first position, we can use all positions up to seq_len - ngram_size + 1
             valid_positions = list(range(seq_len - self.config.ngram_size + 1))
         else:
+            # For final position, we can only use positions from ngram_size - 1 to seq_len
             valid_positions = list(range(self.config.ngram_size - 1, seq_len))
-            
+        
+        # Select only valid positions from activations and labels
         activations = activations[:, valid_positions, :].to(self.config.device)
         labels = labels[:, valid_positions, :]
         
@@ -335,21 +449,37 @@ class NgramProber:
 
     def train_probe(
         self,
-        tokens: torch.Tensor,
+        tokens: Optional[torch.Tensor],
         ngrams: List[Tuple[int, ...]],
         ngram_to_idx: Dict[Tuple[int, ...], int]
     ) -> Dict[str, Dict[str, float]]:
         """Train final-position probe using chunked activations."""
-        total_tokens = len(tokens) * self.config.ctx_len
+        # Count total tokens across all chunks
+        total_tokens = 0
+        chunk_idx = 0
+        while True:
+            chunk = self.load_tokens_chunk(chunk_idx)
+            if chunk is None:
+                break
+            total_tokens += len(chunk)
+            chunk_idx += 1
+        
+        if chunk_idx == 0:
+            raise ValueError("No token chunks found! Run get_tokens() first.")
+        
+        total_tokens_with_context = total_tokens * self.config.ctx_len
         required_tokens = self.config.num_train_tokens + self.config.num_val_tokens
-        if required_tokens > total_tokens:
-            raise ValueError(f"Not enough tokens available ({total_tokens} < {required_tokens})")
+        if required_tokens > total_tokens_with_context:
+            raise ValueError(f"Not enough tokens available ({total_tokens_with_context} < {required_tokens})")
             
         # Calculate total number of possible n-gram positions
-        total_positions = total_tokens - (self.config.ngram_size - 1) * len(tokens)
+        total_positions = total_tokens_with_context - (self.config.ngram_size - 1) * total_tokens
         
         print("\nStarting probe training:")
         print(f"Number of n-grams selected: {len(ngrams)}")
+        print(f"First few n-grams: {ngrams[:5]}")
+        print(f"N-gram types: {[type(ng) for ng in ngrams[:5]]}")
+        print(f"N-gram lengths: {[len(ng) for ng in ngrams[:5]]}")
         print(f"Frequency range: {min(self.ngram_counts.values()) / total_positions:.2e} to {max(self.ngram_counts.values()) / total_positions:.2e}")
         
         # Create frequency vs rank plot
@@ -388,11 +518,17 @@ class NgramProber:
         print(f"Most frequent n-gram appears in {frequencies[0]:.2e} of positions")
         print(f"Least frequent n-gram appears in {frequencies[-1]:.2e} of positions")
         
-        # Calculate number of chunks needed for training and validation
+        # Calculate number of sequences needed for training and validation
         num_train_sequences = math.ceil(self.config.num_train_tokens / self.config.ctx_len)
         num_val_sequences = math.ceil(self.config.num_val_tokens / self.config.ctx_len)
+        
+        # Calculate number of chunks for each split
         num_train_chunks = math.ceil(num_train_sequences / self.config.chunk_size)
         num_val_chunks = math.ceil(num_val_sequences / self.config.chunk_size)
+        
+        print(f"\nSplit configuration:")
+        print(f"Training: {num_train_sequences} sequences in {num_train_chunks} chunks")
+        print(f"Validation: {num_val_sequences} sequences in {num_val_chunks} chunks")
         
         # Create probe for final position
         probe = NgramProbe(
@@ -405,15 +541,17 @@ class NgramProber:
         
         optimizer = torch.optim.Adam(probe.parameters(), lr=self.config.learning_rate)
         
-        # Load and prepare training data
-        print("\nLoading training data for final-position probe...")
+        # Training loop
+        print("\nTraining probe...")
         train_activations = []
         train_labels = []
         
         # Calculate total number of batches for progress bar
         total_batches = 0
         for chunk_idx in range(num_train_chunks):
-            chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
+            chunk_tokens = self.load_tokens_chunk(chunk_idx)
+            if chunk_tokens is None:
+                continue
             total_batches += (len(chunk_tokens) + self.config.batch_size - 1) // self.config.batch_size
         
         # Create progress bar
@@ -421,11 +559,21 @@ class NgramProber:
         current_batch = 0
         
         for chunk_idx in range(num_train_chunks):
+            # Load both tokens and activations for this chunk
+            chunk_tokens = self.load_tokens_chunk(chunk_idx)
+            if chunk_tokens is None:
+                print(f"Warning: Could not load token chunk {chunk_idx}, skipping...")
+                continue
+                
             activations = self.load_activations_chunk(chunk_idx)
             if activations is None:
+                print(f"Warning: Could not load activation chunk {chunk_idx}, skipping...")
                 continue
-            
-            chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
+                
+            # Verify alignment between tokens and activations
+            if not self.verify_chunk_alignment(chunk_tokens, activations, chunk_idx):
+                print(f"Warning: Chunk {chunk_idx} has alignment issues, skipping...")
+                continue
             
             for i in range(0, len(chunk_tokens), self.config.batch_size):
                 batch_end = min(i + self.config.batch_size, len(chunk_tokens))
@@ -446,15 +594,18 @@ class NgramProber:
                 train_activations.append(activations_batch.cpu())
                 train_labels.append(labels.cpu())
                 
-                # Update progress bar with loss
+                # Update progress bar with loss and label statistics
                 current_batch += 1
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'pos_labels': f'{(labels > 0).sum().item()}'
+                })
                 pbar.update(1)
                 
                 del activations_batch, labels, logits
                 torch.cuda.empty_cache()
             
-            del activations
+            del activations, chunk_tokens
             torch.cuda.empty_cache()
         
         pbar.close()
@@ -463,18 +614,28 @@ class NgramProber:
         probe.eval()
         
         print("\nEvaluating final-position probe...")
-        print(f"Number of chunks to evaluate: {self.get_num_chunks()}")
+        print(f"Number of validation chunks to evaluate: {num_val_chunks}")
         auroc_accumulator = {ngram: [] for ngram in ngrams}
         
-        for chunk_idx in range(self.get_num_chunks()):
-            print(f"\nProcessing evaluation chunk {chunk_idx + 1}/{self.get_num_chunks()}")
-            activations = self.load_activations_chunk(chunk_idx)
-            if activations is None:
-                print(f"Warning: Could not load chunk {chunk_idx}, skipping...")
+        for chunk_idx in range(num_val_chunks):
+            print(f"\nProcessing validation chunk {chunk_idx + 1}/{num_val_chunks}")
+            
+            # Load both tokens and activations for this chunk
+            chunk_tokens = self.load_tokens_chunk(chunk_idx + num_train_chunks)
+            if chunk_tokens is None:
+                print(f"Warning: Could not load validation token chunk {chunk_idx + num_train_chunks}, skipping...")
                 continue
                 
-            chunk_tokens = tokens[chunk_idx * self.config.chunk_size:(chunk_idx + 1) * self.config.chunk_size]
-            print(f"Chunk tokens shape: {chunk_tokens.shape}")
+            activations = self.load_activations_chunk(chunk_idx + num_train_chunks)
+            if activations is None:
+                print(f"Warning: Could not load validation activation chunk {chunk_idx + num_train_chunks}, skipping...")
+                continue
+                
+            # Verify alignment between tokens and activations
+            if not self.verify_chunk_alignment(chunk_tokens, activations, chunk_idx + num_train_chunks):
+                print(f"Warning: Validation chunk {chunk_idx + num_train_chunks} has alignment issues, skipping...")
+                continue
+                
             chunk_logits = []
             chunk_labels = []
             
@@ -484,19 +645,20 @@ class NgramProber:
                     batch_tokens = chunk_tokens[i:batch_end]
                     batch_activations = activations[i:batch_end]
                     
+                    # Prepare data for the batch
                     activations_batch, labels = self.prepare_probe_data(
                         batch_tokens, batch_activations, ngrams, ngram_to_idx, 'final'
                     )
+                    
+                    # Get predictions
                     logits = probe(activations_batch)
                     
+                    # Store predictions and labels
                     chunk_logits.append(logits.cpu())
                     chunk_labels.append(labels.cpu())
                     
                     del activations_batch, labels, logits
                     torch.cuda.empty_cache()
-            
-            print(f"Number of logit batches: {len(chunk_logits)}")
-            print(f"Number of label batches: {len(chunk_labels)}")
             
             # Compute metrics for this chunk
             print(f"\nComputing metrics for chunk {chunk_idx}...")
@@ -504,24 +666,30 @@ class NgramProber:
             
             # Accumulate AUROC scores
             for ngram in ngrams:
-                auroc_accumulator[ngram].append(chunk_results[ngram])
+                if ngram in chunk_results:
+                    auroc_accumulator[ngram].append(chunk_results[ngram])
             
             print(f"Completed chunk {chunk_idx} evaluation")
-            del activations, chunk_logits, chunk_labels, chunk_results
+            del activations, chunk_tokens, chunk_logits, chunk_labels, chunk_results
             torch.cuda.empty_cache()
         
         print("\nComputing final probe results...")
+        # Only compute mean for n-grams that have valid scores from at least one chunk
         results = {
-            ngram: np.mean(auroc_accumulator[ngram]) 
-            for ngram in ngrams
+            ngram: np.mean(scores) 
+            for ngram, scores in auroc_accumulator.items() 
+            if len(scores) > 0
         }
         
         # Print summary statistics
         auroc_scores = list(results.values())
-        print(f"Number of n-grams with valid AUROC scores: {len(auroc_scores)}")
-        print(f"Mean AUROC score: {np.mean(auroc_scores):.4f}")
-        print(f"Min AUROC score: {np.min(auroc_scores):.4f}")
-        print(f"Max AUROC score: {np.max(auroc_scores):.4f}")
+        if auroc_scores:
+            print(f"Number of n-grams with valid AUROC scores: {len(auroc_scores)}")
+            print(f"Mean AUROC score: {np.mean(auroc_scores):.4f}")
+            print(f"Min AUROC score: {np.min(auroc_scores):.4f}")
+            print(f"Max AUROC score: {np.max(auroc_scores):.4f}")
+        else:
+            print("Warning: No valid AUROC scores were computed!")
         
         # Save final model
         final_model_path = os.path.join(self.config.output_dir, "probe_final.pt")
@@ -530,13 +698,13 @@ class NgramProber:
         
         return {'final': results}
     
-    def save_results(self, results: Dict[str, Dict[Tuple[int, ...], float]]):
+    def save_results(self, results: Dict[str, Dict[str, float]]):
         """Save results and create plots."""
         # Convert tuple keys to strings for JSON serialization
         json_results = {
             'final': {
-                str(list(ngram)): score  # Convert tuple to list, then to string
-                for ngram, score in results['final'].items()
+                str([list(ngram) if isinstance(ngram, tuple) else list([ngram]) for ngram in ngram_set]): score
+                for ngram_set, score in results['final'].items()
             }
         }
         
@@ -552,10 +720,23 @@ class NgramProber:
         # Extract data for plotting
         log_errors = np.log10(1 - np.array(list(results['final'].values())))
         
-        # Calculate normalized frequencies
-        total_tokens = len(self.tokens) * self.config.ctx_len
-        counts = np.array([self.ngram_counts[ngram] for ngram in results['final'].keys()])
-        frequencies = counts / total_tokens
+        # Calculate total tokens from chunks
+        total_tokens = 0
+        chunk_idx = 0
+        while True:
+            chunk = self.load_tokens_chunk(chunk_idx)
+            if chunk is None:
+                break
+            total_tokens += len(chunk)
+            chunk_idx += 1
+        
+        if chunk_idx == 0:
+            print("Warning: No token chunks found for plotting!")
+            return
+        
+        total_tokens_with_context = total_tokens * self.config.ctx_len
+        counts = np.array([self.ngram_counts[ngram_set] for ngram_set in results['final'].keys()])
+        frequencies = counts / total_tokens_with_context
         log_frequencies = np.log10(frequencies)
         
         # Create histogram
@@ -572,7 +753,7 @@ class NgramProber:
             plt.xlabel("Log10 Error Rate")
             plt.ylabel("Count")
             plt.legend()
-            plt.savefig(os.path.join(plots_dir, f"log_error_rate_histogram_n{self.config.ngram_size}.png"))
+            plt.savefig(os.path.join(plots_dir, f"log_error_rate_histogram_n{self.config.ngram_size}_union{self.config.union_size}.png"))
         plt.close()
         
         # Create scatter plot with normalized frequencies
@@ -602,22 +783,31 @@ class NgramProber:
                 plt.plot(x_range, p(x_range), 'r--', alpha=0.8, label=f'Trend (R² = {r2:.3f})')
             
             plt.legend()
-            plt.savefig(os.path.join(plots_dir, f"log_error_rate_vs_freq_n{self.config.ngram_size}.png"))
+            plt.savefig(os.path.join(plots_dir, f"log_error_rate_vs_freq_n{self.config.ngram_size}_union{self.config.union_size}.png"))
         plt.close()
 
-    def generate_and_save_activations(self, tokens: torch.Tensor) -> None:
+    def generate_and_save_activations(self) -> None:
         """Generate activations for all tokens and save them to disk in chunks."""
         cache_dir = os.path.join(self.config.output_dir, "cache")
         os.makedirs(cache_dir, exist_ok=True)
         base_path = self.get_activations_cache_path()
         
-        print("\nGenerating activations in chunks...")
-        chunk_size = min(self.config.chunk_size, len(tokens))  # Process chunk_size sequences at a time
-        num_chunks = (len(tokens) + chunk_size - 1) // chunk_size
+        # Count number of token chunks
+        chunk_idx = 0
+        while os.path.exists(f"{os.path.join(cache_dir, 'cached_tokens')}_chunk{chunk_idx}.pt"):
+            chunk_idx += 1
         
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min((chunk_idx + 1) * chunk_size, len(tokens))
+        if chunk_idx == 0:
+            raise ValueError("No token chunks found! Run get_tokens() first.")
+        
+        print(f"\nGenerating activations for {chunk_idx} token chunks...")
+        
+        for chunk_idx in range(chunk_idx):
+            # Load token chunk
+            chunk_tokens = self.load_tokens_chunk(chunk_idx)
+            if chunk_tokens is None:
+                print(f"Warning: Could not load token chunk {chunk_idx}, skipping...")
+                continue
             
             chunk_path = f"{base_path}_chunk{chunk_idx}.pt"
             
@@ -625,19 +815,19 @@ class NgramProber:
             if os.path.exists(chunk_path):
                 try:
                     chunk = torch.load(chunk_path)
-                    if isinstance(chunk, torch.Tensor) and chunk.shape == (end_idx - start_idx, self.config.ctx_len, self.model.cfg.d_model):
+                    if isinstance(chunk, torch.Tensor) and chunk.shape == (len(chunk_tokens), self.config.ctx_len, self.model.cfg.d_model):
                         print(f"Chunk {chunk_idx} already exists and is valid, skipping...")
                         continue
                 except Exception:
                     print(f"Chunk {chunk_idx} exists but is corrupted, regenerating...")
             
-            print(f"\nProcessing chunk {chunk_idx + 1}/{num_chunks} (sequences {start_idx} to {end_idx})")
+            print(f"\nProcessing chunk {chunk_idx + 1}/{chunk_idx} (sequences 0 to {len(chunk_tokens)})")
             chunk_activations = []
             
             # Process the chunk in batches
-            for i in tqdm(range(start_idx, end_idx, self.config.model_batch_size)):
-                batch_end = min(i + self.config.model_batch_size, end_idx)
-                batch_tokens = tokens[i:batch_end]
+            for i in tqdm(range(0, len(chunk_tokens), self.config.model_batch_size)):
+                batch_end = min(i + self.config.model_batch_size, len(chunk_tokens))
+                batch_tokens = chunk_tokens[i:batch_end]
                 
                 with torch.no_grad():
                     activations = self.get_activations_batch(batch_tokens)
@@ -651,8 +841,64 @@ class NgramProber:
             torch.save(chunk_activations, chunk_path)
             print(f"Saved chunk {chunk_idx} with shape {chunk_activations.shape}")
             
-            del chunk_activations
+            del chunk_activations, chunk_tokens
             torch.cuda.empty_cache()
+
+    def load_tokens_chunk(self, chunk_idx: int) -> Optional[torch.Tensor]:
+        """Load a specific chunk of tokens."""
+        cache_dir = os.path.join(self.config.output_dir, "cache")
+        base_path = os.path.join(cache_dir, "cached_tokens")
+        chunk_path = f"{base_path}_chunk{chunk_idx}.pt"
+        
+        if not os.path.exists(chunk_path):
+            return None
+        
+        try:
+            # Try to load the chunk
+            chunk = torch.load(chunk_path)
+            
+            # Verify it's a tensor with the expected shape
+            if not isinstance(chunk, torch.Tensor):
+                print(f"Warning: Chunk {chunk_idx} is not a tensor, regenerating...")
+                return None
+            
+            # Verify shape - allow for variable chunk sizes
+            if len(chunk.shape) != 2:
+                print(f"Warning: Chunk {chunk_idx} has wrong number of dimensions: {len(chunk.shape)}, expected 2")
+                return None
+            if chunk.shape[1] != self.config.ctx_len:
+                print(f"Warning: Chunk {chunk_idx} has wrong sequence length: {chunk.shape[1]}, expected {self.config.ctx_len}")
+                return None
+            
+            return chunk
+            
+        except Exception as e:
+            print(f"Warning: Error loading chunk {chunk_idx}: {str(e)}")
+            return None
+
+    def verify_chunk_alignment(self, token_chunk: torch.Tensor, activation_chunk: torch.Tensor, chunk_idx: int) -> bool:
+        """Verify that a token chunk and activation chunk are properly aligned."""
+        # Check number of dimensions
+        if len(token_chunk.shape) != 2 or len(activation_chunk.shape) != 3:
+            print(f"Warning: Chunk {chunk_idx} has wrong number of dimensions: tokens={len(token_chunk.shape)}, activations={len(activation_chunk.shape)}")
+            return False
+        
+        # Check batch size (number of sequences)
+        if token_chunk.shape[0] != activation_chunk.shape[0]:
+            print(f"Warning: Chunk {chunk_idx} has mismatched batch sizes: tokens={token_chunk.shape[0]}, activations={activation_chunk.shape[0]}")
+            return False
+        
+        # Check sequence length
+        if token_chunk.shape[1] != activation_chunk.shape[1]:
+            print(f"Warning: Chunk {chunk_idx} has mismatched sequence lengths: tokens={token_chunk.shape[1]}, activations={activation_chunk.shape[1]}")
+            return False
+        
+        # Check activation dimension
+        if activation_chunk.shape[2] != self.model.cfg.d_model:
+            print(f"Warning: Chunk {chunk_idx} has wrong activation dimension: {activation_chunk.shape[2]}, expected {self.model.cfg.d_model}")
+            return False
+        
+        return True
 
 def main():
     config = NgramProbingConfig()
@@ -668,7 +914,9 @@ def main():
     # Create a prober for initial setup and activation generation
     prober = NgramProber(config)
     dataset = prober.load_dataset()
-    tokens = prober.get_tokens(dataset)
+    
+    # Get tokens (now returns None as we're using chunked loading)
+    prober.get_tokens(dataset)
     
     # Check if activations already exist in the common cache directory
     base_path = prober.get_activations_cache_path()
@@ -679,7 +927,7 @@ def main():
     if chunk_idx == 0:
         # No existing activations found, generate them
         print("\nNo existing activations found. Generating activations (will be reused for all n-gram sizes)...")
-        prober.generate_and_save_activations(tokens)
+        prober.generate_and_save_activations()
     else:
         print(f"\nFound existing activations ({chunk_idx} chunks). Skipping generation.")
     
@@ -700,18 +948,18 @@ def main():
         
         # Create a new prober for this n-gram size
         current_prober = NgramProber(current_config)
-        current_prober.tokens = tokens  # Reuse the same tokens
         
         # Override the cache directory to use the common one
         current_prober.config.output_dir = config.output_dir
         
         # Get n-grams and train probe
-        ngrams = current_prober.get_ngrams(tokens)
+        # Note: We pass None as tokens since we're using chunked loading
+        ngrams = current_prober.get_ngrams(None)
         ngram_list = list(ngrams.keys())
         ngram_to_idx = {ngram: idx for idx, ngram in enumerate(ngram_list)}
         
         # Train probe using the pre-generated activations
-        results = current_prober.train_probe(tokens, ngram_list, ngram_to_idx)
+        results = current_prober.train_probe(None, ngram_list, ngram_to_idx)
         current_prober.save_results(results)
         
         print(f"\nCompleted n-gram size {n}")

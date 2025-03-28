@@ -26,6 +26,8 @@ class NgramProbe(nn.Module):
         
         # Linear layer for prediction - one output per n-gram
         self.linear = nn.Linear(d_model, len(ngrams)).to(device=device, dtype=dtype)
+        self.linear.weight.data.normal_(0, 0.01)
+        self.linear.bias.data.zero_()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the probe."""
